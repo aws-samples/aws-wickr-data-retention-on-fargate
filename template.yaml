@@ -1,0 +1,637 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Template that deploys AWS Wickr Data Retention and all required AWS services
+
+Parameters:
+  DeployName:
+    Description: Deployment name tag prefix
+    Type: String
+    Default: wickr-dr-deploy
+  
+  BotImage:
+    Description: Wickr cloud bot ecr image
+    Type: String
+    Default: public.ecr.aws/x3s2s6k3/wickrio/bot-compliance-cloud:6.24.03.01 #default to static ECR repo working version but leave parameter to specify alternate or latest
+
+  DrBotName:
+    Description: Name of data retention bot found in AWS Wickr admin panel 
+    Type: String
+
+  DrBotPw:
+    Description: Initial bot pw, then will need to be changed to value seen in CW log group post bot registration
+    Type: String
+  
+  FileRotateMins:
+    Description: Time in minutes to rotate and send retention logs to S3
+    Type: Number
+
+  PrivateSubnetCidr:
+    Description: The CIDR for the Private Subnet
+    Type: String
+    Default: 10.87.0.0/24
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.87.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${DeployName}-Vpc
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Ref DeployName
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+  
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Sub '${AWS::Region}a'
+      CidrBlock: 10.87.10.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${DeployName}-PubSub-a'
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${DeployName}-PubRoutes'
+    
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet
+
+  NatGwEip:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Ref DeployName
+
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Sub ${AWS::Region}a
+      CidrBlock: !Ref PrivateSubnetCidr
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${DeployName}-PrivSub-a'
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      AllocationId: !GetAtt NatGwEip.AllocationId
+      Tags:
+        - Key: Name
+          Value: !Ref DeployName
+  
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${DeployName}-PrivRoutes'
+  
+  DefaultPrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnet
+  
+  SecretManagerKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Enabled: true
+      EnableKeyRotation: true
+      PendingWindowInDays: 7
+      KeyPolicy:
+        Version: 2012-10-17
+        Statement:
+          - Sid: Allow SecretsManager to use key
+            Effect: Allow
+            Principal:
+              Service: "secretsmanager.amazonaws.com"
+            Action: 
+            - kms:Encrypt
+            - kms:DescribeKey
+            - kms:GenerateDataKey
+            - kms:Decrypt
+            Resource: "*"
+            Condition:
+              StringEquals:
+                kms:CallerAccount: !Ref 'AWS::AccountId'
+                kms:ViaService: !Sub "secretsmanager.${AWS::Region}.amazonaws.com"                   
+          - Sid: Enable IAM User Administration
+            Effect: Allow
+            Principal:
+              AWS: 
+                - !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "*"
+            Resource: "*"
+
+  SecretManagerKeyAlias:
+     Type: 'AWS::KMS::Alias'
+     Properties:
+       AliasName: !Sub alias/${DeployName}-SecretManagerKey
+       TargetKeyId: !Ref SecretManagerKey
+
+  BucketKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Enabled: true
+      EnableKeyRotation: true
+      PendingWindowInDays: 7
+      KeyPolicy:
+        Version: 2012-10-17
+        Statement:
+          - Sid: Allow S3 to use the key for encryption and decryption
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action:
+            - "kms:Encrypt"
+            - "kms:Decrypt"
+            - "kms:ReEncrypt*"
+            - "kms:GenerateDataKey*"
+            - "kms:DescribeKey"
+            Resource: "*"
+            Condition:
+              StringEquals:
+                kms:CallerAccount: !Ref 'AWS::AccountId'
+                kms:ViaService: !Join ['.', ['s3', !Ref 'AWS::Region', 'amazonaws.com']]
+          - Sid: Enable IAM User Administration
+            Effect: Allow
+            Principal: 
+              AWS: 
+                - !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "*"
+            Resource: "*"
+
+  BucketKeyAlias:
+     Type: 'AWS::KMS::Alias'
+     Properties:
+       AliasName: !Sub alias/${DeployName}-BucketKey
+       TargetKeyId: !Ref BucketKey
+
+  CloudWatchKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Enabled: true
+      EnableKeyRotation: true
+      PendingWindowInDays: 7
+      KeyPolicy:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: !Sub "logs.${AWS::Region}.amazonaws.com"
+            Action:
+              - kms:Encrypt*
+              - kms:Decrypt*
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:Describe*
+            Resource: "*"
+            Condition:
+              StringEquals:
+                aws:SourceAccount:  !Ref 'AWS::AccountId'
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "*"
+            Resource: "*"
+
+  CloudWatchkeyAlias:
+     Type: 'AWS::KMS::Alias'
+     Properties:
+       AliasName: !Sub alias/${DeployName}-CloudWatchKey
+       TargetKeyId: !Ref CloudWatchKey
+
+  SnsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Enabled: true
+      EnableKeyRotation: true
+      PendingWindowInDays: 7
+      KeyPolicy:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action:
+              - kms:Encrypt
+              - kms:GenerateDataKey*
+            Resource: "*"
+            Condition:
+              StringEquals:
+                aws:SourceAccount:  !Ref 'AWS::AccountId'
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "*"
+            Resource: "*"
+
+  SnsKeyAlias:
+     Type: 'AWS::KMS::Alias'
+     Properties:
+       AliasName: !Sub alias/${DeployName}-SnsKey
+       TargetKeyId: !Ref SnsKey           
+
+  WickrSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub ${DrBotName}-secret
+      Description: Data Retention bot secrets
+      SecretString: !Sub |
+        {
+          "password": "${DrBotPw}",
+          "s3_bucket_name": "${Bucket}",
+          "s3_region": "${AWS::Region}",
+          "s3_folder_name": "data-retention-logs/",
+          "sns_topic_arn": "${SnsTopic}"
+        }
+      KmsKeyId: !GetAtt SecretManagerKey.Arn
+      Tags:
+      - Key: Name
+        Value: !Sub ${DeployName}-Secret
+
+  Bucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "${AWS::AccountId}-${DeployName}-wickrdr"
+      LoggingConfiguration:
+        DestinationBucketName: !Ref LoggingBucket
+        LogFilePrefix: wickr-dr
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              KMSMasterKeyID: !Ref BucketKey
+              SSEAlgorithm: aws:kms
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      Tags:
+      - Key: Name
+        Value: !Ref DeployName
+  
+  S3BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref Bucket
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: Only allow Secure Transport
+            Action:
+              - s3:*
+            Effect: Deny
+            Resource:
+              - !Sub "arn:${AWS::Partition}:s3:::${Bucket}"
+              - !Sub "arn:${AWS::Partition}:s3:::${Bucket}/*"
+            Principal: "*"
+            Condition:
+              Bool:
+                aws:SecureTransport:
+                  false
+          
+  LoggingBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::AccountId}-${DeployName}-wickrdrlogging"
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: GlacierRule
+            Status: Enabled
+            ExpirationInDays: 730
+            Transitions:
+              - TransitionInDays: 180
+                StorageClass: GLACIER
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: TRUE
+        BlockPublicPolicy: TRUE
+        IgnorePublicAcls: TRUE
+        RestrictPublicBuckets: TRUE
+        
+  S3BucketPolicyLogging:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref LoggingBucket
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: Logging Policy
+            Effect: Allow
+            Action: 
+              - s3:PutObject
+            Principal:
+              Service: logging.s3.amazonaws.com
+            Resource: 
+              - !Sub "arn:${AWS::Partition}:s3:::${LoggingBucket}/*"
+              - !Sub "arn:${AWS::Partition}:s3:::${LoggingBucket}"
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref 'AWS::AccountId'
+          - Sid: Only allow Secure Transport
+            Action:
+              - s3:*
+            Effect: Deny
+            Resource:
+              - !Sub "arn:${AWS::Partition}:s3:::${LoggingBucket}"
+              - !Sub "arn:${AWS::Partition}:s3:::${LoggingBucket}/*"
+            Principal: "*"
+            Condition:
+              Bool:
+                aws:SecureTransport:
+                  false
+
+  EFSFileSystem:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      PerformanceMode: generalPurpose
+      Encrypted: true
+      FileSystemTags:
+        - Key: Name
+          Value: !Sub ${DeployName}-FileSystem
+
+  EFSMountTarget:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref EFSFileSystem
+      SubnetId: !Ref PrivateSubnet
+      SecurityGroups:
+        - !Ref EFSSecurityGroup
+
+  ContainerLogGroup:
+    Type: "AWS::Logs::LogGroup"
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub "/ecs/${DeployName}/wickrdr"
+      RetentionInDays: 30
+      KmsKeyId: !GetAtt CloudWatchKey.Arn
+      Tags:
+        - Key: Name
+          Value: !Ref DeployName
+
+  SnsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: !Sub '${DeployName}-SnsTopic'
+      KmsMasterKeyId: !GetAtt SnsKey.Arn
+
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: 
+              - ecs-tasks.amazonaws.com
+            Action: 
+            - 'sts:AssumeRole'
+            Condition:
+              ArnLike: 
+                aws:SourceArn: !Sub arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:*
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      ManagedPolicyArns:
+      - 'arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy'
+
+      Tags:
+      - Key: Name
+        Value: !Sub ${DeployName}-ExecutionRole
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${DeployName}-TaskRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+            Action:
+            - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: !Sub "${DeployName}-DataRetentionBotPolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+                - Effect: Allow
+                  Action:
+                    - s3:PutObject
+                    - s3:ListBucket
+                  Resource: !Sub "arn:aws:s3:::${AWS::AccountId}-${DeployName}-wickrdr/*"
+                - Effect: Allow
+                  Action: cloudwatch:PutMetricData
+                  Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${ContainerLogGroup}:*"
+                - Effect: Allow
+                  Action: sns:Publish
+                  Resource: !Sub "arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${DeployName}-SnsTopic"
+                - Effect: Allow
+                  Action: secretsmanager:GetSecretValue
+                  Resource: !Ref  WickrSecret
+                - Effect: Allow
+                  Action: kms:GenerateDataKey
+                  Resource: !Sub "arn:aws:s3:::${AWS::AccountId}-${DeployName}-wickrdr/*" 
+                - Effect: Allow
+                  Action: 
+                    - kms:GenerateDataKey
+                    - kms:Decrypt
+                  Resource: 
+                    - !GetAtt SecretManagerKey.Arn
+                    - !GetAtt BucketKey.Arn
+                - Effect: Allow
+                  Action:
+                    - elasticfilesystem:ClientMount
+                    - elasticfilesystem:ClientRootAccess
+                    - elasticfilesystem:ClientWrite
+                  Resource: !Sub "arn:aws:elasticfilesystem:${AWS::Region}:${AWS::AccountId}:file-system/${EFSFileSystem}"
+      Tags:
+      - Key: Name
+        Value: !Sub ${DeployName}-TaskRole
+
+  ContainerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub '${DeployName}ContainerSecurityGroup'
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+      - Description: Allow local 443 traffic inbound from internal VPC
+        IpProtocol: tcp 
+        FromPort: 443
+        ToPort: 443
+        CidrIp: !Ref PrivateSubnetCidr
+      SecurityGroupEgress: 
+      - Description: Allow local 443 traffic outbound from internal VPC
+        IpProtocol: tcp
+        FromPort: 443
+        ToPort: 443
+        CidrIp: 0.0.0.0/0
+      - Description: Allow EFS 2049 traffic oubound to internal VPC
+        IpProtocol: tcp
+        FromPort: 2049
+        ToPort: 2049
+        CidrIp: !Ref PrivateSubnetCidr
+
+  EFSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub '${DeployName}EFSSecurityGroup'
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+      - Description: Allow inbound EFS connection from ECS container in private subnet
+        IpProtocol: tcp
+        FromPort: 2049
+        ToPort: 2049
+        CidrIp: !Ref PrivateSubnetCidr
+      SecurityGroupEgress:
+      - Description: Allow egress 2049 tcp communication to containers in private subnet
+        IpProtocol: tcp
+        FromPort: 2049
+        ToPort: 2049
+        CidrIp: !Ref PrivateSubnetCidr
+
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub '${DeployName}-cluster'
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+      CapacityProviders:
+        - FARGATE
+        - FARGATE_SPOT
+      Tags:
+        - Key: Name
+          Value: !Ref DeployName
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${DeployName}-TaskDefinition'
+      NetworkMode: "awsvpc"
+      RequiresCompatibilities:
+        - "FARGATE"
+      Cpu: "1024"
+      Memory: "4096"
+      ExecutionRoleArn: !GetAtt  ExecutionRole.Arn
+      TaskRoleArn: !Ref TaskRole
+      ContainerDefinitions:
+        - Name: !Sub ${DeployName}-DrBotContainerDefinition
+          Image: !Ref BotImage
+          MountPoints:
+            - SourceVolume: efs-volume
+              ContainerPath: !Sub '/tmp/${DrBotName}'
+              ReadOnly: false
+          Cpu: 0
+          Essential: true
+          Environment:
+            - Name: "AWS_DEFAULT_REGION"
+              Value: !Sub "${AWS::Region}"
+            - Name: "AWS_SECRET_NAME"
+              Value: !Sub "${DrBotName}-secret"
+            - Name: "WICKRIO_BOT_NAME"
+              Value: !Sub "${DrBotName}"
+            - Name: "WICKRIO_COMP_TIMEROTATE"
+              Value: !Sub "${FileRotateMins}"
+            - Name: "WICKRIO_METRICS_TYPE"
+              Value: "cloudwatch"
+          LogConfiguration:
+            LogDriver: "awslogs"
+            Options:
+              awslogs-region: !Sub ${AWS::Region}
+              awslogs-group: !Ref ContainerLogGroup
+              awslogs-stream-prefix: ecs
+      Volumes:
+        - Name: efs-volume
+          EFSVolumeConfiguration:
+            FilesystemId: !Ref EFSFileSystem
+            TransitEncryption: ENABLED
+            AuthorizationConfig:
+              IAM: ENABLED
+
+  Service:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub '${DeployName}-Service'
+      Cluster: !Ref EcsCluster
+      TaskDefinition: !Ref TaskDefinition
+      DeploymentConfiguration:
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+      DeploymentController:
+        Type: ECS
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets:
+          - !Ref PrivateSubnet
+          SecurityGroups:
+          - !Ref ContainerSecurityGroup
